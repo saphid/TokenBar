@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: Scans staged files for potential secrets, API keys, and tokens.
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#   — or — make install-hooks
+
+set -euo pipefail
+
+# Patterns that indicate leaked secrets (case-insensitive where needed)
+PATTERNS=(
+    # OpenAI / Anthropic API keys
+    'sk-[a-zA-Z0-9_-]{20,}'
+    'sk-ant-[a-zA-Z0-9_-]{20,}'
+    'sk-proj-[a-zA-Z0-9_-]{20,}'
+    # GitHub tokens
+    'ghp_[a-zA-Z0-9]{36}'
+    'gho_[a-zA-Z0-9]{36}'
+    'github_pat_[a-zA-Z0-9_]{22,}'
+    # AWS keys
+    'AKIA[A-Z0-9]{16}'
+    # Slack tokens
+    'xoxb-[a-zA-Z0-9-]+'
+    'xoxp-[a-zA-Z0-9-]+'
+    # Private keys
+    '-----BEGIN .* PRIVATE KEY-----'
+    # Generic high-entropy secrets (Bearer with long token)
+    'Bearer [a-zA-Z0-9_/+=-]{40,}'
+    # CircleCI tokens
+    'circle-token=[a-f0-9]{40}'
+)
+
+FOUND=0
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+for pattern in "${PATTERNS[@]}"; do
+    # Search staged content (not working tree) for each pattern
+    MATCHES=$(git diff --cached -U0 --diff-filter=ACM | grep -Eni "$pattern" 2>/dev/null || true)
+    if [ -n "$MATCHES" ]; then
+        if [ "$FOUND" -eq 0 ]; then
+            echo ""
+            echo "========================================"
+            echo "  SECRETS DETECTED IN STAGED CHANGES"
+            echo "========================================"
+            echo ""
+        fi
+        FOUND=1
+        echo "Pattern: $pattern"
+        echo "$MATCHES" | head -5
+        echo ""
+    fi
+done
+
+# Also check for common secret file patterns being staged
+SECRET_FILES=$(echo "$STAGED_FILES" | grep -Ei '(\.env$|\.env\.|credentials\.json|\.pem$|\.key$|secret\.?|\.token$|token\.json)' 2>/dev/null || true)
+if [ -n "$SECRET_FILES" ]; then
+    if [ "$FOUND" -eq 0 ]; then
+        echo ""
+        echo "========================================"
+        echo "  SUSPICIOUS FILES IN STAGED CHANGES"
+        echo "========================================"
+        echo ""
+    fi
+    FOUND=1
+    echo "Potentially sensitive files being committed:"
+    echo "$SECRET_FILES" | while read -r f; do echo "  - $f"; done
+    echo ""
+fi
+
+if [ "$FOUND" -ne 0 ]; then
+    echo "Commit blocked. If this is a false positive, use:"
+    echo "  git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+exit 0

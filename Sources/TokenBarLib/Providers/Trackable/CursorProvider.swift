@@ -209,3 +209,28 @@ struct CursorProvider: UsageProvider {
         return nil
     }
 }
+
+// MARK: - RegisteredProvider Conformance
+
+enum CursorProviderDef: RegisteredProvider {
+    static let typeId = "cursor"
+    static let defaultName = "Cursor"
+    static let iconSymbol = "cursorarrow.rays"
+    static let dashboardURL: URL? = URL(string: "https://www.cursor.com/settings")
+    static let category: ProviderCategory = .trackable
+    static let dataSourceDescription: String? = "Cursor local database"
+
+    static let detection = DetectionSpec(
+        paths: ["~/Library/Application Support/Cursor"],
+        commands: ["cursor"]
+    )
+
+    static let iconSpec = IconSpec(
+        appBundlePaths: ["/Applications/Cursor.app"],
+        faviconDomain: "cursor.com"
+    )
+
+    static func create(instanceId: String, label: String, config: ProviderConfig) -> any UsageProvider {
+        CursorProvider()
+    }
+}

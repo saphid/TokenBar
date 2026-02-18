@@ -2,3 +2,8 @@
 .swiftpm/
 *.xcodeproj
 DerivedData/
+.env
+.env.*
+*.pem
+*.key
+credentials.json

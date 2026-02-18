@@ -2,37 +2,55 @@ import Foundation
 
 /// Tracks OpenAI API spending for the current month via the organization costs endpoint.
 ///
-/// Requires:
-/// - An OpenAI API key stored in Keychain (key: "openai_api_key")
-/// - The key must have organization read access (admin or reader role)
-///
-/// Optionally, the user sets a monthly budget in UserDefaults ("openai_budget").
-/// If set, shows spend as percentage of budget. Otherwise shows dollar amount.
+/// Each instance can target a different account/org by using a separate API key
+/// and optional Organization ID header. This enables corporate vs personal profiles.
 struct OpenAIProvider: UsageProvider {
-    let id = "openai"
-    let name = "OpenAI"
+    let id: String
+    let name: String
     let iconSymbol = "brain.head.profile"
     let dashboardURL: URL? = URL(string: "https://platform.openai.com/usage")
 
-    private static let keychainKey = "openai_api_key"
-    private static let budgetKey = "openai_budget"
+    private let keychainKey: String
+    private let organizationId: String?
+    private let budgetKey: String
+
     private static let costsURL = "https://api.openai.com/v1/organization/costs"
 
+    /// Creates a new OpenAI provider instance.
+    /// - Parameters:
+    ///   - instanceId: Unique ID for this instance (e.g. "openai", "openai-corp")
+    ///   - label: Display name (e.g. "OpenAI Personal", "OpenAI Corporate")
+    ///   - keychainKey: Keychain key storing the API key
+    ///   - organizationId: Optional OpenAI-Organization header value
+    ///   - budgetKey: UserDefaults key for monthly budget
+    init(
+        instanceId: String = "openai",
+        label: String = "OpenAI API",
+        keychainKey: String = "openai_api_key",
+        organizationId: String? = nil,
+        budgetKey: String = "openai_budget"
+    ) {
+        self.id = instanceId
+        self.name = label
+        self.keychainKey = keychainKey
+        self.organizationId = organizationId
+        self.budgetKey = budgetKey
+    }
+
     func isAvailable() async -> Bool {
-        KeychainHelper.load(key: Self.keychainKey) != nil
+        KeychainHelper.load(key: keychainKey) != nil
     }
 
     func fetchUsage() async throws -> UsageSnapshot {
-        guard let apiKey = KeychainHelper.load(key: Self.keychainKey), !apiKey.isEmpty else {
+        guard let apiKey = KeychainHelper.load(key: keychainKey), !apiKey.isEmpty else {
             throw ProviderError.authenticationRequired
         }
 
         let monthlyCost = try await fetchMonthlyCost(apiKey: apiKey)
-        let budget = UserDefaults.standard.double(forKey: Self.budgetKey)
+        let budget = UserDefaults.standard.double(forKey: budgetKey)
 
         var quotas: [UsageQuota] = []
 
-        // Calculate reset date (first of next month)
         let calendar = Calendar.current
         let now = Date()
         let nextMonth = calendar.date(byAdding: .month, value: 1,
@@ -47,7 +65,6 @@ struct OpenAIProvider: UsageProvider {
                 resetsAt: nextMonth
             ))
         } else {
-            // No budget set — show cost directly
             quotas.append(UsageQuota(
                 percentUsed: -1,
                 label: "Monthly Spend",
@@ -58,10 +75,10 @@ struct OpenAIProvider: UsageProvider {
         }
 
         return UsageSnapshot(
-            providerId: "openai",
+            providerId: id,
             quotas: quotas,
             capturedAt: Date(),
-            accountTier: "API"
+            accountTier: organizationId != nil ? "Org" : "API"
         )
     }
 
@@ -81,6 +98,9 @@ struct OpenAIProvider: UsageProvider {
         request.httpMethod = "GET"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let orgId = organizationId, !orgId.isEmpty {
+            request.setValue(orgId, forHTTPHeaderField: "OpenAI-Organization")
+        }
         request.timeoutInterval = 15
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -119,5 +139,58 @@ struct OpenAIProvider: UsageProvider {
         }
 
         return totalCost
+    }
+}
+
+// MARK: - RegisteredProvider Conformance
+
+enum OpenAIProviderDef: RegisteredProvider {
+    static let typeId = "openai"
+    static let defaultName = "OpenAI API"
+    static let iconSymbol = "brain.head.profile"
+    static let dashboardURL: URL? = URL(string: "https://platform.openai.com/usage")
+    static let category: ProviderCategory = .trackable
+    static let supportsMultipleInstances: Bool = true
+    static let dataSourceDescription: String? = "OpenAI API"
+
+    static let detection = DetectionSpec()
+
+    static let iconSpec = IconSpec(faviconDomain: "openai.com")
+
+    static let configFields: [ConfigFieldDescriptor] = [
+        ConfigFieldDescriptor(
+            id: "keychainKey",
+            label: "API Key",
+            fieldType: .secureText,
+            placeholder: "sk-...",
+            helpText: "Get your key at platform.openai.com/api-keys",
+            isRequired: true
+        ),
+        ConfigFieldDescriptor(
+            id: "organizationId",
+            label: "Organization ID",
+            fieldType: .text,
+            placeholder: "org-...",
+            helpText: "Leave empty for default org"
+        ),
+        ConfigFieldDescriptor(
+            id: "monthlyBudget",
+            label: "Monthly Budget",
+            fieldType: .currency,
+            placeholder: "$",
+            helpText: "Set to 0 or leave empty to show dollar amount instead of percentage"
+        ),
+    ]
+
+    static func create(instanceId: String, label: String, config: ProviderConfig) -> any UsageProvider {
+        let keychainKey = config.string("keychainKey") ?? "openai_api_key"
+        let organizationId = config.string("organizationId")
+        return OpenAIProvider(
+            instanceId: instanceId,
+            label: label,
+            keychainKey: keychainKey,
+            organizationId: organizationId,
+            budgetKey: "openai_budget_\(instanceId)"
+        )
     }
 }

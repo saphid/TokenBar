@@ -1,4 +1,4 @@
-.PHONY: build release run install clean
+.PHONY: build release run install clean install-hooks
 
 APP_NAME    = TokenBar
 BUILD_DIR   = .build/release
@@ -29,6 +29,12 @@ install: build
 	@rm -rf /Applications/$(APP_BUNDLE)
 	@cp -r $(APP_BUNDLE) /Applications/
 	@echo "Installed. Launch from /Applications or Spotlight."
+
+# Install git hooks
+install-hooks:
+	@cp scripts/pre-commit .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "Git hooks installed."
 
 # Clean everything
 clean:
