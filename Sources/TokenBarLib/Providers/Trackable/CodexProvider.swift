@@ -81,11 +81,83 @@ struct CodexProvider: UsageProvider {
         }
     }
 
+    // MARK: - Workspace UUID Cache
+    //
+    // The Codex app-server returns rate limits for whichever workspace the
+    // auth token is scoped to. Workspace UUIDs are NOT the same as org IDs
+    // and cannot be discovered via API. The only way to learn a workspace
+    // UUID is to observe it in auth.json when the user happens to be on
+    // that workspace.
+    //
+    // This cache persists org_id → workspace_uuid mappings in UserDefaults.
+    // It updates on every fetch cycle by reading auth.json. Over time, as
+    // the user naturally switches workspaces in any tool (CLI, Desktop,
+    // ChatGPT, etc.), all workspace UUIDs get captured automatically.
+
+    private static let workspaceCacheKey = "codexWorkspaceUUIDs"
+
+    /// Returns the cached workspace UUID for an org, or nil if not yet discovered.
+    static func cachedWorkspaceUUID(forOrgId orgId: String) -> String? {
+        let cache = UserDefaults.standard.dictionary(forKey: workspaceCacheKey) as? [String: String] ?? [:]
+        return cache[orgId]
+    }
+
+    /// Reads auth.json and updates the workspace UUID cache.
+    /// The JWT id_token contains the org list; the access_token contains the
+    /// current workspace UUID. We identify which org owns the current UUID by:
+    ///   1. If there's only one org whose UUID we DON'T already know, and the
+    ///      current UUID doesn't match any cached value, it must be that org's.
+    ///   2. For the default org, we always know the UUID (it's the one present
+    ///      at first launch).
+    @discardableResult
+    static func updateWorkspaceCache(codexDir: String? = nil) -> [String: String] {
+        let dir = codexDir ?? defaultCodexDir
+        guard let uuid = currentWorkspaceUUID(codexDir: dir) else { return [:] }
+
+        let orgs = discoverOrganizations(codexDir: dir)
+        guard !orgs.isEmpty else { return [:] }
+
+        var cache = UserDefaults.standard.dictionary(forKey: workspaceCacheKey) as? [String: String] ?? [:]
+
+        // If this UUID is already mapped, nothing to learn.
+        if cache.values.contains(uuid) { return cache }
+
+        // Find orgs that don't yet have a cached UUID.
+        let unmappedOrgs = orgs.filter { cache[$0.id] == nil }
+
+        if unmappedOrgs.count == 1 {
+            // Only one unmapped org — this UUID must be theirs.
+            cache[unmappedOrgs[0].id] = uuid
+        } else if let defaultOrg = orgs.first(where: { $0.isDefault }) {
+            // Multiple unmapped orgs. If we haven't seen the default org yet,
+            // assume the current UUID belongs to it (auth.json starts on the
+            // default workspace). Otherwise, we can't determine ownership.
+            if cache[defaultOrg.id] == nil {
+                cache[defaultOrg.id] = uuid
+            } else {
+                // All we know is this UUID isn't the default's. If there are
+                // exactly 2 orgs total, we can deduce by elimination.
+                let nonDefault = orgs.filter { !$0.isDefault }
+                if nonDefault.count == 1 {
+                    cache[nonDefault[0].id] = uuid
+                }
+            }
+        }
+
+        UserDefaults.standard.set(cache, forKey: workspaceCacheKey)
+        return cache
+    }
+
     func isAvailable() async -> Bool {
         FileManager.default.fileExists(atPath: codexDir)
     }
 
     func fetchUsage() async throws -> UsageSnapshot {
+        // Update the workspace UUID cache from auth.json on every cycle.
+        // This learns new workspace UUIDs as the user switches between
+        // workspaces in any tool (CLI, Desktop, ChatGPT, etc.).
+        Self.updateWorkspaceCache(codexDir: codexDir)
+
         // Try app-server RPC first (real-time data)
         if let snapshot = try? await fetchViaAppServer() {
             return snapshot
@@ -292,11 +364,22 @@ struct CodexProvider: UsageProvider {
         }
 
         // For non-default orgs, resolve the workspace identifier to use.
-        // A workspace UUID (not an org ID) is required for chatgptAuthTokens
-        // to return real rate limit data.
+        // Preference: explicit config → cached UUID → org ID (fallback).
+        // Workspace UUIDs give real data; org IDs create a "detached" session
+        // that shows the correct plan type but may not reflect actual usage.
         let chatgptAccountId: String?
         if !isDefaultOrg {
-            chatgptAccountId = workspaceId  // nil if not configured
+            if let ws = workspaceId, !ws.isEmpty {
+                chatgptAccountId = ws
+            } else if let orgId = orgId, let cached = cachedWorkspaceUUID(forOrgId: orgId) {
+                chatgptAccountId = cached
+            } else {
+                // Fall back to org ID. This creates a detached session that
+                // returns the correct plan type but usage may not be accurate.
+                // Once the workspace UUID is discovered (by the user switching
+                // to this workspace in any Codex tool), the cache will be used.
+                chatgptAccountId = orgId
+            }
         } else {
             chatgptAccountId = nil
         }
@@ -325,10 +408,6 @@ struct CodexProvider: UsageProvider {
                 Thread.sleep(forTimeInterval: 3)
             }
             rateLimitsId = 20
-        } else if !isDefaultOrg && chatgptAccountId == nil {
-            // Non-default org without workspace UUID — the data from the default
-            // workspace will be returned, which is inaccurate. We still proceed
-            // but the caller should be aware the data is for the default workspace.
         }
 
         // Send rateLimits read
