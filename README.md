@@ -22,10 +22,9 @@
 
 TokenBar is a lightweight macOS menu bar app that tracks token usage and spending across your AI coding tools. It auto-detects installed providers and shows real-time usage stats at a glance.
 
-<!-- TODO: Add screenshot here once you have one -->
-<!-- <p align="center">
+<p align="center">
   <img src="docs/assets/screenshot.png" alt="TokenBar screenshot" width="500">
-</p> -->
+</p>
 
 ## Features
 
