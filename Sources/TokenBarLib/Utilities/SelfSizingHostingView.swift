@@ -5,12 +5,21 @@ import SwiftUI
 /// when its SwiftUI content changes size. Designed for use as an
 /// NSMenuItem's `view` where the menu needs to grow/shrink when
 /// content expands (e.g. disclosure triangles, accordion sections).
+///
+/// Uses a subclassed NSHostingView to detect when SwiftUI invalidates
+/// its intrinsic content size, then forces the enclosing NSMenu to
+/// re-layout so the menu grows downward instead of clipping content.
 class SelfSizingHostingView<Content: View>: NSView {
-    private let hostingView: NSHostingView<Content>
+    private let hostingView: LayoutTrackingHostingView<Content>
+    private var lastKnownSize: NSSize = .zero
 
     init(rootView: Content) {
-        hostingView = NSHostingView(rootView: rootView)
+        hostingView = LayoutTrackingHostingView(rootView: rootView)
         super.init(frame: .zero)
+
+        hostingView.onIntrinsicSizeInvalidated = { [weak self] in
+            self?.recalculateSize()
+        }
 
         hostingView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hostingView)
@@ -22,7 +31,9 @@ class SelfSizingHostingView<Content: View>: NSView {
             hostingView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
-        frame.size = hostingView.fittingSize
+        let size = hostingView.fittingSize
+        frame.size = size
+        lastKnownSize = size
     }
 
     @available(*, unavailable)
@@ -34,20 +45,39 @@ class SelfSizingHostingView<Content: View>: NSView {
 
     override func layout() {
         super.layout()
-        let newSize = hostingView.fittingSize
-        if frame.size != newSize {
-            frame.size = newSize
-            invalidateIntrinsicContentSize()
-        }
+        recalculateSize()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // Re-measure once we're in the menu's window
+        recalculateSize()
+    }
+
+    private func recalculateSize() {
         let newSize = hostingView.fittingSize
-        if frame.size != newSize {
-            frame.size = newSize
-            invalidateIntrinsicContentSize()
+        guard abs(newSize.width - lastKnownSize.width) > 0.5
+           || abs(newSize.height - lastKnownSize.height) > 0.5 else { return }
+        lastKnownSize = newSize
+        frame.size = newSize
+        invalidateIntrinsicContentSize()
+        // Force the enclosing menu to re-layout for the new content size
+        if let menu = enclosingMenuItem?.menu {
+            menu.update()
+            window?.layoutIfNeeded()
+        }
+    }
+}
+
+/// NSHostingView subclass that notifies when SwiftUI invalidates its
+/// intrinsic content size (i.e. when the SwiftUI body changes dimensions).
+private class LayoutTrackingHostingView<Content: View>: NSHostingView<Content> {
+    var onIntrinsicSizeInvalidated: (() -> Void)?
+
+    override func invalidateIntrinsicContentSize() {
+        super.invalidateIntrinsicContentSize()
+        // Dispatch async to avoid re-entrant layout during the current pass
+        DispatchQueue.main.async { [weak self] in
+            self?.onIntrinsicSizeInvalidated?()
         }
     }
 }

@@ -16,6 +16,7 @@ struct CodexProvider: UsageProvider {
 
     private let profile: String?
     private let orgId: String?
+    private let workspaceId: String?
     private let codexDir: String
 
     static let defaultCodexDir: String = {
@@ -23,11 +24,12 @@ struct CodexProvider: UsageProvider {
         return "\(home)/.codex"
     }()
 
-    init(instanceId: String = "codex", label: String = "Codex", profile: String? = nil, orgId: String? = nil, codexDir: String? = nil) {
+    init(instanceId: String = "codex", label: String = "Codex", profile: String? = nil, orgId: String? = nil, workspaceId: String? = nil, codexDir: String? = nil) {
         self.id = instanceId
         self.name = label
         self.profile = profile
         self.orgId = orgId
+        self.workspaceId = workspaceId
         self.codexDir = codexDir ?? Self.defaultCodexDir
     }
 
@@ -89,8 +91,42 @@ struct CodexProvider: UsageProvider {
             return snapshot
         }
 
-        // Fall back to session JSONL parsing (stale but works offline)
+        // Fall back to session JSONL parsing (stale but works offline).
+        // Note: session files are org-agnostic so multi-org instances may
+        // show the same data when the app-server is unavailable.
         return try fetchViaSessionFiles()
+    }
+
+    // MARK: - Helpers
+
+    /// Derives a human-readable label from the window duration in minutes.
+    private static func labelForWindowDuration(_ minutes: Int) -> String {
+        switch minutes {
+        case ...360:   return "\(minutes / 60)h Window"
+        case ...1440:  return "Daily"
+        case ...10080: return "Weekly"
+        default:       return "Monthly"
+        }
+    }
+
+    /// Parses a numeric percent value that may arrive as Int (app-server) or Double (session files).
+    private static func parsePercent(_ value: Any?) -> Double? {
+        if let d = value as? Double { return d }
+        if let i = value as? Int { return Double(i) }
+        if let n = value as? NSNumber { return n.doubleValue }
+        return nil
+    }
+
+    /// Reads the access token from auth.json for chatgptAuthTokens login.
+    private static func readAccessToken(codexDir: String) -> String? {
+        let authPath = "\(codexDir)/auth.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = json["tokens"] as? [String: Any],
+              let accessToken = tokens["access_token"] as? String else {
+            return nil
+        }
+        return accessToken
     }
 
     // MARK: - App-Server JSON-RPC
@@ -104,9 +140,10 @@ struct CodexProvider: UsageProvider {
 
         var quotas: [UsageQuota] = []
 
-        // Primary: 5-hour window
         if let primary = rateLimits["primary"] as? [String: Any],
-           let usedPercent = primary["usedPercent"] as? Double {
+           let usedPercent = Self.parsePercent(primary["usedPercent"]) {
+            let windowMins = primary["windowDurationMins"] as? Int
+            let label = windowMins.map { Self.labelForWindowDuration($0) } ?? "Primary"
             let resetsAt: Date? = {
                 guard let ts = primary["resetsAt"] as? Int else { return nil }
                 return Date(timeIntervalSince1970: TimeInterval(ts))
@@ -114,15 +151,16 @@ struct CodexProvider: UsageProvider {
 
             quotas.append(UsageQuota(
                 percentUsed: usedPercent,
-                label: "5h Window",
+                label: label,
                 detailText: "\(Int(usedPercent))% used",
                 resetsAt: resetsAt
             ))
         }
 
-        // Secondary: weekly window
         if let secondary = rateLimits["secondary"] as? [String: Any],
-           let usedPercent = secondary["usedPercent"] as? Double {
+           let usedPercent = Self.parsePercent(secondary["usedPercent"]) {
+            let windowMins = secondary["windowDurationMins"] as? Int
+            let label = windowMins.map { Self.labelForWindowDuration($0) } ?? "Secondary"
             let resetsAt: Date? = {
                 guard let ts = secondary["resetsAt"] as? Int else { return nil }
                 return Date(timeIntervalSince1970: TimeInterval(ts))
@@ -130,7 +168,7 @@ struct CodexProvider: UsageProvider {
 
             quotas.append(UsageQuota(
                 percentUsed: usedPercent,
-                label: "Weekly",
+                label: label,
                 detailText: "\(Int(usedPercent))% used",
                 resetsAt: resetsAt
             ))
@@ -175,9 +213,15 @@ struct CodexProvider: UsageProvider {
 
     private func runAppServer() async throws -> [String: Any] {
         return try await withCheckedThrowingContinuation { continuation in
+            let codexDir = self.codexDir
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let result = try Self.executeAppServerSync(profile: self.profile, orgId: self.orgId)
+                    let result = try Self.executeAppServerSync(
+                        profile: self.profile,
+                        orgId: self.orgId,
+                        workspaceId: self.workspaceId,
+                        codexDir: codexDir
+                    )
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -186,16 +230,44 @@ struct CodexProvider: UsageProvider {
         }
     }
 
-    private static func executeAppServerSync(profile: String?, orgId: String? = nil) throws -> [String: Any] {
+    /// Reads the JWT from auth.json and returns the default org's ID, or nil.
+    private static func defaultOrgId(codexDir: String) -> String? {
+        discoverOrganizations(codexDir: codexDir)
+            .first(where: { $0.isDefault })?
+            .id
+    }
+
+    /// Reads the workspace UUID from the access_token JWT in auth.json.
+    /// This UUID corresponds to the currently logged-in (default) workspace.
+    static func currentWorkspaceUUID(codexDir: String? = nil) -> String? {
+        let dir = codexDir ?? defaultCodexDir
+        let authPath = "\(dir)/auth.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = json["tokens"] as? [String: Any],
+              let accessToken = tokens["access_token"] as? String else { return nil }
+
+        let parts = accessToken.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+
+        var base64 = String(parts[1])
+        while base64.count % 4 != 0 { base64 += "=" }
+
+        guard let payloadData = Data(base64Encoded: base64),
+              let claims = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+              let auth = claims["https://api.openai.com/auth"] as? [String: Any],
+              let accountId = auth["chatgpt_account_id"] as? String else { return nil }
+
+        return accountId
+    }
+
+    private static func executeAppServerSync(profile: String?, orgId: String? = nil, workspaceId: String? = nil, codexDir: String) throws -> [String: Any] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
 
         var args = ["codex", "-s", "read-only", "-a", "untrusted"]
         if let profile = profile {
             args += ["-p", profile]
-        }
-        if let orgId = orgId {
-            args += ["-c", "org_id=\"\(orgId)\""]
         }
         args.append("app-server")
         process.arguments = args
@@ -208,24 +280,65 @@ struct CodexProvider: UsageProvider {
 
         try process.run()
 
-        // Send initialize
-        let initMsg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"TokenBar\",\"version\":\"1.0.0\"}}}\n"
+        // Determine the login strategy:
+        // - Default org (or no org specified): skip login; app-server auto-reads auth.json
+        // - Non-default org with workspace UUID: use chatgptAuthTokens login
+        // - Non-default org without workspace UUID: cannot fetch accurate data
+        let isDefaultOrg: Bool
+        if let orgId = orgId {
+            isDefaultOrg = (orgId == defaultOrgId(codexDir: codexDir))
+        } else {
+            isDefaultOrg = true
+        }
+
+        // For non-default orgs, resolve the workspace identifier to use.
+        // A workspace UUID (not an org ID) is required for chatgptAuthTokens
+        // to return real rate limit data.
+        let chatgptAccountId: String?
+        if !isDefaultOrg {
+            chatgptAccountId = workspaceId  // nil if not configured
+        } else {
+            chatgptAccountId = nil
+        }
+
+        let needsLogin = chatgptAccountId != nil && readAccessToken(codexDir: codexDir) != nil
+        let capsJson = needsLogin ? ",\"capabilities\":{\"experimentalApi\":true}" : ""
+        let initMsg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"TokenBar\",\"version\":\"1.0.0\"},\"protocolVersion\":\"2\"\(capsJson)}}\n"
         stdinPipe.fileHandleForWriting.write(initMsg.data(using: .utf8)!)
 
-        // Wait for initialize response
         Thread.sleep(forTimeInterval: 2)
 
+        var rateLimitsId = 2
+        if needsLogin, let wsId = chatgptAccountId, let accessToken = readAccessToken(codexDir: codexDir) {
+            if let loginParams = try? JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "account/login/start",
+                "params": [
+                    "type": "chatgptAuthTokens",
+                    "accessToken": accessToken,
+                    "chatgptAccountId": wsId
+                ]
+            ] as [String: Any]),
+               let loginStr = String(data: loginParams, encoding: .utf8) {
+                stdinPipe.fileHandleForWriting.write((loginStr + "\n").data(using: .utf8)!)
+                Thread.sleep(forTimeInterval: 3)
+            }
+            rateLimitsId = 20
+        } else if !isDefaultOrg && chatgptAccountId == nil {
+            // Non-default org without workspace UUID — the data from the default
+            // workspace will be returned, which is inaccurate. We still proceed
+            // but the caller should be aware the data is for the default workspace.
+        }
+
         // Send rateLimits read
-        let rlMsg = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":{}}\n"
+        let rlMsg = "{\"jsonrpc\":\"2.0\",\"id\":\(rateLimitsId),\"method\":\"account/rateLimits/read\",\"params\":{}}\n"
         stdinPipe.fileHandleForWriting.write(rlMsg.data(using: .utf8)!)
 
-        // Wait for response
         Thread.sleep(forTimeInterval: 3)
 
-        // Close stdin to signal we're done
         stdinPipe.fileHandleForWriting.closeFile()
 
-        // Read all output
         let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         process.terminate()
         process.waitUntilExit()
@@ -234,14 +347,28 @@ struct CodexProvider: UsageProvider {
             throw ProviderError.parseFailed("No output from app-server")
         }
 
-        // Parse the JSON-RPC responses — find the rateLimits response (id: 2)
+        // Parse JSON-RPC responses. Check for the explicit rateLimits/read
+        // response and any account/rateLimits/updated notifications.
+        var explicitResult: [String: Any]?
+        var notificationResult: [String: Any]?
+
         for line in output.split(separator: "\n") {
             guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let responseId = json["id"] as? Int, responseId == 2,
-                  let result = json["result"] as? [String: Any] else { continue }
-            return result
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+
+            if let responseId = json["id"] as? Int, responseId == rateLimitsId,
+               let result = json["result"] as? [String: Any] {
+                explicitResult = result
+            }
+
+            if json["method"] as? String == "account/rateLimits/updated",
+               let params = json["params"] as? [String: Any] {
+                notificationResult = params
+            }
         }
+
+        if let result = explicitResult { return result }
+        if let result = notificationResult { return result }
 
         throw ProviderError.parseFailed("No rateLimits response from app-server")
     }
@@ -256,28 +383,32 @@ struct CodexProvider: UsageProvider {
         var quotas: [UsageQuota] = []
 
         if let primary = rateLimits["primary"] as? [String: Any],
-           let usedPercent = primary["used_percent"] as? Double {
+           let usedPercent = Self.parsePercent(primary["used_percent"]) {
+            let windowMins = primary["window_minutes"] as? Int
+            let label = windowMins.map { Self.labelForWindowDuration($0) } ?? "Primary"
             let resetsAt: Date? = {
                 guard let ts = primary["resets_at"] as? Int else { return nil }
                 return Date(timeIntervalSince1970: TimeInterval(ts))
             }()
             quotas.append(UsageQuota(
                 percentUsed: usedPercent,
-                label: "5h Window",
+                label: label,
                 detailText: "\(Int(usedPercent))% used",
                 resetsAt: resetsAt
             ))
         }
 
         if let secondary = rateLimits["secondary"] as? [String: Any],
-           let usedPercent = secondary["used_percent"] as? Double {
+           let usedPercent = Self.parsePercent(secondary["used_percent"]) {
+            let windowMins = secondary["window_minutes"] as? Int
+            let label = windowMins.map { Self.labelForWindowDuration($0) } ?? "Secondary"
             let resetsAt: Date? = {
                 guard let ts = secondary["resets_at"] as? Int else { return nil }
                 return Date(timeIntervalSince1970: TimeInterval(ts))
             }()
             quotas.append(UsageQuota(
                 percentUsed: usedPercent,
-                label: "Weekly",
+                label: label,
                 detailText: "\(Int(usedPercent))% used",
                 resetsAt: resetsAt
             ))
@@ -441,6 +572,13 @@ enum CodexProviderDef: RegisteredProvider {
             placeholder: "org-...",
             helpText: "OpenAI organization ID for this Codex instance"
         ),
+        ConfigFieldDescriptor(
+            id: "codexWorkspaceId",
+            label: "Workspace UUID",
+            fieldType: .text,
+            placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            helpText: "Required for non-default orgs. Find it by switching workspace in Codex Desktop, then running: codex debug app-server"
+        ),
     ]
 
     static func create(instanceId: String, label: String, config: ProviderConfig) -> any UsageProvider {
@@ -448,7 +586,8 @@ enum CodexProviderDef: RegisteredProvider {
             instanceId: instanceId,
             label: label,
             profile: config.string("codexProfile"),
-            orgId: config.string("codexOrgId")
+            orgId: config.string("codexOrgId"),
+            workspaceId: config.string("codexWorkspaceId")
         )
     }
 }
