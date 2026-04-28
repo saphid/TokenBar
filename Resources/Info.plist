@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>TokenBar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.alexsouthwell.tokenbar</string>
+    <string>com.saphid.tokenbar</string>
     <key>CFBundleVersion</key>
     <string>0.2.0</string>
     <key>CFBundleShortVersionString</key>
